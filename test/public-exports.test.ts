@@ -44,6 +44,22 @@ const EXPECTED_EXPORTS: ExpectedExport[] = [
   { subpath: 'gbrain/import-file', canary: ['importFromContent'] },
   { subpath: 'gbrain/transcription', canary: [] },
   { subpath: 'gbrain/embedding', canary: ['embed'] },
+  // Embedding-plane repair surface for hosts that open many brains under one
+  // configured embedder (dimension realignment + bounded re-embed drains).
+  {
+    subpath: 'gbrain/embedding-migration',
+    canary: [
+      'runSchemaTransition',
+      'readDimPinnedWidths',
+      'schemaRebuildNeeded',
+      'applyEmbeddingMigration',
+      'reconcilePageSignatures',
+      'completeEmbeddingMigration',
+      'readMigrationState',
+    ],
+  },
+  { subpath: 'gbrain/embedding-dim-check', canary: ['readContentChunksEmbeddingDim', 'readFactsEmbeddingDim'] },
+  { subpath: 'gbrain/embed-stale', canary: ['embedStaleForSource', 'embedStaleFacts', 'probeEmbedder'] },
   { subpath: 'gbrain/config', canary: ['loadConfig'] },
   { subpath: 'gbrain/markdown', canary: ['splitBody', 'parseMarkdown', 'serializeMarkdown'] },
   { subpath: 'gbrain/backoff', canary: [] },
@@ -70,7 +86,7 @@ describe('public exports — package.json exports map', () => {
     // Adding new exports: increment this + add to EXPECTED_EXPORTS below.
     // Removing exports: see CLAUDE.md "Removing any of these is a
     // breaking change going forward" — bump minor and update this count.
-    expect(count).toBe(22);
+    expect(count).toBe(25);
   });
 
   test('EXPECTED_EXPORTS list matches the exports map exactly (no drift)', () => {

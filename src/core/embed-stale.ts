@@ -28,6 +28,7 @@ import {
 } from './search/embedding-column.ts';
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
 import { AbortError } from './abort-check.ts';
+import { readFactsEmbeddingDim } from './embedding-dim-check.ts';
 
 /**
  * W0 fix-wave (Tier-1 #3, CONFIRMED): the ONE carry-through field list for
@@ -474,6 +475,126 @@ export async function embedStaleForSource(
 
     // Short batch = end of stale set; advance and exit.
     if (batch.length < batchSize) {
+      result.done = true;
+      return result;
+    }
+  }
+}
+
+export interface EmbedStaleFactsOpts {
+  /** Facts per keyset page. Default 200. */
+  batchSize?: number;
+  /** Stop after this many facts were embedded (bounded work per call). */
+  maxFacts?: number;
+  /** AbortSignal honored between batches and inside the embed call. */
+  signal?: AbortSignal;
+  /** Test seam; defaults to `embedBatchWithBackoff`. */
+  embedFn?: (texts: string[], opts: { abortSignal?: AbortSignal }) => Promise<Float32Array[]>;
+}
+
+export interface EmbedStaleFactsResult {
+  /** Facts whose embedding landed in this call. */
+  embedded: number;
+  /** Facts the embedder could not produce a correctly-sized vector for. */
+  failed: number;
+  /** True iff every active NULL-embedding fact was visited. */
+  done: boolean;
+  /** True iff the loop exited because `signal.aborted` fired. */
+  aborted: boolean;
+}
+
+/**
+ * Embed every ACTIVE fact whose `facts.embedding` is NULL.
+ *
+ * `facts.embedding` is a dim-pinned text-embedding column: a dimension
+ * transition (`runSchemaTransition`) rebuilds it and NULLs every vector, and
+ * an insert while the embedder was unavailable leaves it NULL. Nothing else
+ * refills it (the fact write paths only embed at insert time), so without
+ * this drain those facts silently drop out of vector recall forever.
+ *
+ * Re-entrancy contract mirrors `embedStaleForSource`: the `embedding IS NULL`
+ * predicate is the checkpoint, the keyset cursor is only a progress
+ * optimization, and each UPDATE is guarded on `embedding IS NULL` so a
+ * concurrent writer that already embedded the row is never overwritten.
+ * Expired facts are skipped — they are excluded from every active read.
+ * Embed failures do not throw: the rows stay NULL and are counted in
+ * `failed`, so the next call retries them.
+ */
+export async function embedStaleFacts(
+  engine: BrainEngine,
+  opts: EmbedStaleFactsOpts = {},
+): Promise<EmbedStaleFactsResult> {
+  const result: EmbedStaleFactsResult = { embedded: 0, failed: 0, done: false, aborted: false };
+  const col = await readFactsEmbeddingDim(engine);
+  if (!col.exists || col.columnType === null) {
+    result.done = true;
+    return result;
+  }
+  const cast = col.columnType === 'halfvec' ? 'halfvec' : 'vector';
+  const batchSize = Math.max(1, Math.min(opts.batchSize ?? 200, 2000));
+  const maxFacts = opts.maxFacts ?? Number.POSITIVE_INFINITY;
+  const signal = opts.signal;
+  const embedFn = opts.embedFn ?? ((texts, fnOpts) =>
+    embedBatchWithBackoff(texts, { abortSignal: fnOpts.abortSignal }));
+
+  let afterId = 0;
+  for (;;) {
+    if (signal?.aborted) {
+      result.aborted = true;
+      return result;
+    }
+    const rows = await engine.executeRaw<{ id: number | string; fact: string }>(
+      `SELECT id, fact FROM facts
+        WHERE embedding IS NULL AND expired_at IS NULL AND id > $1
+        ORDER BY id LIMIT $2`,
+      [afterId, batchSize],
+    );
+    if (rows.length === 0) {
+      result.done = true;
+      return result;
+    }
+    afterId = Number(rows[rows.length - 1].id);
+
+    let vectors: Float32Array[];
+    try {
+      vectors = await embedFn(rows.map((row) => row.fact), { abortSignal: signal });
+    } catch (e) {
+      if (signal?.aborted) {
+        result.aborted = true;
+        return result;
+      }
+      result.failed += rows.length;
+      process.stderr.write(
+        `\n  [embed-stale] facts batch embed failed: ${e instanceof Error ? e.message : String(e)}\n`,
+      );
+      if (rows.length < batchSize) {
+        result.done = true;
+        return result;
+      }
+      continue;
+    }
+
+    for (let i = 0; i < rows.length; i++) {
+      const vector = vectors[i];
+      // A wrong-width vector would abort the UPDATE with pgvector's bare
+      // "expected N dimensions" error; count it instead so one misconfigured
+      // embedder cannot turn the drain into a crash loop.
+      if (!vector || vector.length === 0 || (col.dims !== null && vector.length !== col.dims)) {
+        result.failed += 1;
+        continue;
+      }
+      const literal = '[' + Array.from(vector).join(',') + ']';
+      const updated = await engine.executeRaw<{ id: number | string }>(
+        `UPDATE facts SET embedding = $1::${cast}, embedded_at = now()
+          WHERE id = $2 AND embedding IS NULL
+          RETURNING id`,
+        [literal, rows[i].id],
+      );
+      if (updated.length > 0) result.embedded += 1;
+      if (result.embedded >= maxFacts) return result;
+    }
+
+    if (rows.length < batchSize) {
       result.done = true;
       return result;
     }

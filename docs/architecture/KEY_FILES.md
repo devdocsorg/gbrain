@@ -479,7 +479,12 @@ gbrain-evals consumes: `gbrain/engine`, `gbrain/types`, `gbrain/operations`,
 `gbrain/transcription`, `gbrain/embedding`, `gbrain/config`, `gbrain/markdown`,
 `gbrain/backoff`, `gbrain/search/hybrid`, `gbrain/search/expansion`,
 `gbrain/extract`. Removing any of these is a breaking change for the
-gbrain-evals consumer.
+gbrain-evals consumer. `gbrain/embedding-migration`,
+`gbrain/embedding-dim-check`, and `gbrain/embed-stale` expose the
+embedding-plane repair primitives (`runSchemaTransition`,
+`applyEmbeddingMigration`, the column-width readers, and the bounded
+`embedStaleForSource` / `embedStaleFacts` re-embed drains) to hosts that open
+many brains under one configured embedder.
 
 ## Hindsight calibration wave (key files cluster)
 
